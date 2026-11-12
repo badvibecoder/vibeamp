@@ -44,13 +44,14 @@ audio_data_callback :: proc "c" (device: ^ma.device, output: rawptr, input: rawp
 
 	// A seek is requested by the UI thread; perform it here, where the decoder
 	// is only ever touched.
-	req := intrinsics.atomic_load_explicit(&audio.seek_req, .Acquire)
+	req := intrinsics.atomic_load_explicit(&audio.seek_req, .Seq_Cst)
 	if req >= 0 {
-		intrinsics.atomic_store_explicit(&audio.seek_req, i64(-1), .Release)
+		intrinsics.atomic_store_explicit(&audio.seek_req, i64(-1), .Seq_Cst)
 		ma.decoder_seek_to_pcm_frame(&audio.decoder, u64(req))
 	}
+	intrinsics.atomic_thread_fence(.Seq_Cst)
 
-	if !bool(intrinsics.atomic_load_explicit(&audio.playing, .Acquire)) {
+	if !bool(intrinsics.atomic_load_explicit(&audio.playing, .Seq_Cst)) {
 		return // miniaudio pre-fills the buffer with silence
 	}
 
@@ -67,13 +68,18 @@ audio_data_callback :: proc "c" (device: ^ma.device, output: rawptr, input: rawp
 			read += more
 		} else {
 			intrinsics.atomic_store_explicit(&audio.finished, b32(true), .Release)
-			intrinsics.atomic_store_explicit(&audio.playing, b32(false), .Release)
+			intrinsics.atomic_store_explicit(&audio.playing, b32(false), .Seq_Cst)
 		}
 	}
 
-	cur: u64
-	if ma.decoder_get_cursor_in_pcm_frames(&audio.decoder, &cur) == .SUCCESS {
-		intrinsics.atomic_store_explicit(&audio.cursor, cur, .Release)
+	// Publish the decoder position only when no seek is outstanding. The UI
+	// moves the cursor the instant it asks, and a slow seek that finishes
+	// afterwards must not drag the display backwards.
+	if intrinsics.atomic_load_explicit(&audio.seek_req, .Seq_Cst) < 0 {
+		cur: u64
+		if ma.decoder_get_cursor_in_pcm_frames(&audio.decoder, &cur) == .SUCCESS {
+			intrinsics.atomic_store_explicit(&audio.cursor, cur, .Release)
+		}
 	}
 
 	// Tap: append a mono mix of what was just written.

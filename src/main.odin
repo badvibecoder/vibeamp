@@ -4,6 +4,15 @@ import "base:runtime"
 import "core:strings"
 import win "core:sys/windows"
 
+// SetCapture/ReleaseCapture are missing from the shipped bindings.
+foreign import u32 "system:User32.lib"
+
+@(default_calling_convention="system")
+foreign u32 {
+	SetCapture     :: proc(hWnd: win.HWND) -> win.HWND ---
+	ReleaseCapture :: proc() -> win.BOOL ---
+}
+
 //
 // vibeamp — v0.6
 //
@@ -15,32 +24,40 @@ import win "core:sys/windows"
 APP_NAME     :: "vibeamp"
 WINDOW_CLASS :: "VibeAmpWindowClass"
 
-CLIENT_WIDTH  :: 400
-CLIENT_HEIGHT :: 226
+CLIENT_WIDTH  :: 407
+CLIENT_HEIGHT :: 250
 
 SIZE_STEPS := [3]i32{1, 2, 4}
 
 // --- LCD geometry, in device-independent pixels at 1x -------------------
 
-// The matrix is three stacked blocks: the scrolling title, the spectrum
-// analyzer under it, and one blank dot row as a buffer before the text.
+// The matrix is four stacked blocks: a blank dot row at the top, the scrolling
+// title, the spectrum analyzer under it, and a blank dot row at the bottom.
+LCD_TOP_ROWS    :: 1
 LCD_ROWS        :: 8
 LCD_SPEC_ROWS   :: 8
 LCD_BUFFER_ROWS :: 1
-LCD_MATRIX_ROWS :: LCD_ROWS + LCD_SPEC_ROWS + LCD_BUFFER_ROWS
+LCD_MATRIX_ROWS :: LCD_TOP_ROWS + LCD_ROWS + LCD_SPEC_ROWS + LCD_BUFFER_ROWS
 
 LCD_DOT        :: i32(3)
 LCD_GAP        :: i32(1)
 LCD_MARGIN_X   :: i32(10)
 LCD_MARGIN_TOP :: i32(10)
 LCD_BORDER     :: i32(2)
+LCD_PAD        :: i32(4)  // green between the bezel and the dot field
 
 LCD_INFO_GAP :: i32(4)  // text strip -> info line
 LCD_INFO_H   :: i32(9)
 LCD_LOAD_GAP :: i32(6)  // info line -> load controls
 LCD_LOAD_H   :: i32(10)
-LCD_ICON_GAP :: i32(6)  // load controls -> icon row
+LCD_ICON_GAP :: i32(4)  // seek band -> icon row
 LCD_ICON_H   :: i32(20)
+
+// Seek bar: a thin line with a draggable thumb, under the track info.
+SEEK_GAP   :: i32(4)  // buffer above and below the band
+SEEK_BAND  :: i32(10) // total band height
+SEEK_BAR_H :: i32(4)  // visible line thickness
+SEEK_THUMB :: i32(4)  // thumb width
 
 // Playlist block: a framed list of the loaded tracks, under the LOAD controls.
 PLAYLIST_ROWS   :: 6
@@ -137,6 +154,7 @@ Control :: enum u8 {
 	List_Down,
 	List_Row,
 	Theme,
+	Seek,
 }
 
 SIZE_CONTROLS := [3]Control{.Size_1, .Size_2, .Size_4}
@@ -189,9 +207,11 @@ g: struct {
 	painted_bars: [MAX_COLS]u8,
 	list_scroll:  int,
 	idle_since:   f64, // when playback left Playing; -1 while playing
-
-	class_name:  win.wstring,
+	seeking:      bool,
+	seek_preview: f32,
+	last_seek:    f64,
 	title:       win.wstring,
+	class_name:  win.wstring,
 	cursor_hand: win.HCURSOR,
 
 	ctx: runtime.Context,
@@ -217,6 +237,7 @@ Layout :: struct {
 	panel: win.RECT,
 	grid:  win.RECT,
 	info:  win.RECT,
+	seek:  win.RECT,
 	load:  win.RECT,
 	playlist: win.RECT,
 	arrow_up:   win.RECT,
@@ -267,9 +288,11 @@ build_layout :: proc "contextless" (client_w: i32, s: Scale) -> Layout {
 	pitch  := dot + gap
 	margin := dm(s, LCD_MARGIN_X)
 	border := dm(s, LCD_BORDER)
+	lcd_pad    := dm(s, LCD_PAD)
 
-	// The bezel is part of the display, so the grid must fit inside it.
-	avail := client_w - 2*(margin + border)
+	// The bezel and the green padding are part of the display, so the grid must
+	// fit inside them.
+	avail := client_w - 2*(margin + border + lcd_pad)
 	if pitch <= 0 || avail < dot {
 		return lay
 	}
@@ -295,21 +318,24 @@ build_layout :: proc "contextless" (client_w: i32, s: Scale) -> Layout {
 	g_playlist := dm(s, PLAYLIST_GAP)
 	g_info := dm(s, LCD_INFO_GAP)
 	g_load := dm(s, LCD_LOAD_GAP)
+	g_seek := dm(s, SEEK_GAP)
+	seek_h := dm(s, SEEK_BAND)
 	g_icon := dm(s, LCD_ICON_GAP)
 
 	top     := dm(s, LCD_MARGIN_TOP)
-	panel_w := grid_w + 2*border
-	panel_h := 2*border + grid_h + g_info + info_h + g_load + load_h + g_playlist + playlist_h + g_icon + icon_h
+	panel_w := grid_w + 2*(border + lcd_pad)
+	panel_h := 2*(border + lcd_pad) + grid_h + g_info + info_h + g_load + load_h + g_playlist + playlist_h + g_seek + seek_h + g_icon + icon_h
 
 	lay.panel = rect(margin, top, margin + panel_w, top + panel_h)
 	lay.cols  = int(cols)
 
-	ix := margin + border
-	iy := top + border
+	ix := margin + border + lcd_pad
+	iy := top + border + lcd_pad
 	lay.grid = rect(ix, iy, ix + grid_w, iy + grid_h)
 
 	y := iy + grid_h + g_info
 	lay.info = rect(ix, y, ix + grid_w, y + info_h)
+
 	y += info_h + g_load
 	lay.load = rect(ix, y, ix + grid_w, y + load_h)
 
@@ -325,7 +351,11 @@ build_layout :: proc "contextless" (client_w: i32, s: Scale) -> Layout {
 	lay.arrow_up = rect(content_right - arrow, content_top, content_right, content_top + arrow)
 	lay.arrow_down = rect(content_right - arrow, content_bottom - arrow, content_right, content_bottom)
 
-	y += playlist_h + g_icon
+	// Seek band sits between the playlist and the transport.
+	y += playlist_h + g_seek
+	lay.seek = rect(ix, y, ix + grid_w, y + seek_h)
+
+	y += seek_h + g_icon
 	lay.icons = rect(ix, y, ix + grid_w, y + icon_h)
 
 	// Size gauge, bottom aligned in the icon row.
@@ -399,6 +429,7 @@ build_layout :: proc "contextless" (client_w: i32, s: Scale) -> Layout {
 	add_hit(&lay, rect_pad(lay.load_file, dm(s, 2)), .Load_File)
 	add_hit(&lay, rect_pad(lay.load_folder, dm(s, 2)), .Load_Folder)
 	add_hit(&lay, rect_pad(lay.color_btn, dm(s, 3)), .Theme)
+	add_hit(&lay, rect_pad(lay.seek, dm(s, 2)), .Seek)
 	add_hit(&lay, rect_pad(lay.arrow_up, dm(s, 3)), .List_Up)
 	add_hit(&lay, rect_pad(lay.arrow_down, dm(s, 3)), .List_Down)
 
@@ -577,6 +608,30 @@ window_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM,
 		on_click(hwnd, lparam)
 		return 0
 
+	case win.WM_MOUSEMOVE:
+		if g.seeking {
+			x := i32(i16(u16(lparam & 0xFFFF)))
+			g.seek_preview = seek_time_at(hwnd, x)
+			// Seeking a long MP3 makes the decoder scan, so throttle while
+			// dragging; the bar itself still follows the mouse every move.
+			now := clock_seconds()
+			if now - g.last_seek >= 0.12 {
+				g.last_seek = now
+				audio_seek(g.seek_preview)
+			}
+			invalidate(hwnd)
+			return 0
+		}
+
+	case win.WM_LBUTTONUP:
+		if g.seeking {
+			g.seeking = false
+			audio_seek(g.seek_preview)
+			win.ReleaseCapture()
+			invalidate(hwnd)
+			return 0
+		}
+
 	case win.WM_KEYDOWN:
 		on_key(hwnd, int(wparam))
 		return 0
@@ -720,7 +775,11 @@ build_info_text :: proc "contextless" () {
 		g.info_text = ""
 		return
 	}
-	n := put_clock(b, 0, audio_position())
+	pos := audio_position()
+	if g.seeking {
+		pos = g.seek_preview
+	}
+	n := put_clock(b, 0, pos)
 	n  = put_str(b, n, " / ")
 	n  = put_clock(b, n, audio.duration)
 	n  = put_str(b, n, " MP3")
@@ -831,6 +890,13 @@ on_click :: proc (hwnd: win.HWND, lparam: win.LPARAM) {
 		}
 	case .Theme:
 		cycle_theme(hwnd)
+	case .Seek:
+		g.seeking      = true
+		g.seek_preview = seek_time_at(hwnd, x)
+		audio_seek(g.seek_preview)
+		g.last_seek = clock_seconds()
+		win.SetCapture(hwnd)
+		invalidate(hwnd)
 	}
 }
 
@@ -1128,6 +1194,7 @@ draw_panel :: proc "contextless" (dc: win.HDC, lay: ^Layout, s: Scale, now: f64)
 	win.FillRect(dc, &lay.panel, g.brush_lcd_panel)
 	draw_matrix(dc, lay, s, now)
 	draw_info_row(dc, lay, s)
+	draw_seek(dc, lay, s)
 	draw_load_row(dc, lay, s)
 	draw_playlist(dc, lay, s)
 	draw_icons(dc, lay, s, now)
@@ -1153,20 +1220,22 @@ draw_matrix :: proc "contextless" (dc: win.HDC, lay: ^Layout, s: Scale, now: f64
 	idle := idle_active(now)
 
 	for row in 0 ..< LCD_MATRIX_ROWS {
+		content := row - LCD_TOP_ROWS
 		for x in 0 ..< n {
 			lit := false
 			switch {
-			case row < LCD_ROWS:
-				lit = is_lit(columns[x], row)
-			case row < LCD_ROWS + LCD_SPEC_ROWS:
-				at := row - LCD_ROWS
+			case content < 0 || content >= LCD_ROWS + LCD_SPEC_ROWS:
+				// Buffer rows stay blank.
+			case content < LCD_ROWS:
+				lit = is_lit(columns[x], content)
+			case:
+				at := content - LCD_ROWS
 				if idle {
 					lit = idle_lit(x, at, n, now)
 				} else {
 					lit = at >= LCD_SPEC_ROWS - int(g.bars[x])
 				}
 			}
-			// The buffer row stays blank.
 
 			brush := g.brush_lcd_unlit
 			if lit {
@@ -1204,6 +1273,80 @@ draw_info_row :: proc "contextless" (dc: win.HDC, lay: ^Layout, s: Scale) {
 	y := lay.info.top + dm(s, 1)
 	draw_small_text(dc, lay.info.left, y, s, name, ink)
 	draw_small_text(dc, lay.info.right - time_w, y, s, g.info_text, ink)
+}
+
+// Progress line: light for unheard, dark for played, with a draggable thumb.
+draw_seek :: proc "contextless" (dc: win.HDC, lay: ^Layout, s: Scale) {
+	band_h  := dm(s, SEEK_BAND)
+	bar_h   := dm(s, SEEK_BAR_H)
+	thumb_w := dm(s, SEEK_THUMB)
+
+	left  := lay.seek.left
+	width := lay.seek.right - lay.seek.left
+	if width <= 0 || bar_h <= 0 {
+		return
+	}
+	bar_y := lay.seek.top + (band_h - bar_h)/2
+
+	// Unheard portion, always drawn so the control reads as a track.
+	fill_rect(dc, left, bar_y, width, bar_h, g.brush_lcd_unlit)
+
+	if !g.track_loaded || audio.duration <= 0.0 {
+		return
+	}
+
+	dur := audio.duration
+	pos := audio_position()
+	if g.seeking {
+		pos = g.seek_preview
+	}
+	if pos < 0 {
+		pos = 0
+	}
+	if pos > dur {
+		pos = dur
+	}
+
+	played := i32(f32(width)*(pos/dur) + 0.5)
+	if played > width {
+		played = width
+	}
+	fill_rect(dc, left, bar_y, played, bar_h, g.brush_lcd_lit)
+
+	// The thumb sits on the boundary and is taller than the line.
+	tx := left + played - thumb_w/2
+	if tx < left {
+		tx = left
+	}
+	if tx + thumb_w > lay.seek.right {
+		tx = lay.seek.right - thumb_w
+	}
+	fill_rect(dc, tx, lay.seek.top, thumb_w, band_h, g.brush_lcd_lit)
+}
+
+// Maps a client x to a time in the current track, pixel by pixel.
+seek_time_at :: proc "contextless" (hwnd: win.HWND, x: i32) -> f32 {
+	if audio.duration <= 0.0 {
+		return 0
+	}
+	client: win.RECT
+	win.GetClientRect(hwnd, &client)
+
+	s := Scale{dpi = win.GetDpiForWindow(hwnd), step = current_step()}
+	lay := build_layout(client.right - client.left, s)
+
+	width := lay.seek.right - lay.seek.left
+	if width <= 0 {
+		return 0
+	}
+	rel := x - lay.seek.left
+	if rel < 0 {
+		rel = 0
+	}
+	if rel > width {
+		rel = width
+	}
+	return f32(rel) / f32(width) * audio.duration
 }
 
 draw_load_row :: proc "contextless" (dc: win.HDC, lay: ^Layout, s: Scale) {

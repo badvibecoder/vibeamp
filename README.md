@@ -5,8 +5,8 @@ No runtime, no installer, no external DLLs: one `.exe` that opens instantly and
 plays MP3s.
 
 Current state: **v0.13** — a double-height LCD matrix: the title marquee on top,
-a live spectrum analyzer under it, then the track info, the LOAD controls, a
-framed playlist and a clickable transport. Four LCD palettes, sessions
+a live spectrum analyzer under it, then the track info, a scrub bar, the LOAD
+controls, a framed playlist and a clickable transport. Four LCD palettes, sessions
 remembered between runs, and only one instance at a time.
 
 ![vibeamp playing](docs/v0.13-green.png)
@@ -47,6 +47,7 @@ Click anything in the panel. Everything also has a keyboard shortcut:
 | `LOAD FOLDER` | pick a folder; every `*.mp3` in it becomes the playlist | |
 | size gauge | switch between 1x / 2x / 4x | `=` and `-` |
 | backlight icon | cycle the LCD palette: green → amber → red → grey | |
+| seek bar | click to jump, drag to scrub through the track | |
 | prev / next | previous / next track | |
 | rewind / forward | seek 5 seconds back / forward | |
 | play / pause | start or resume / pause (pause flashes) | `Space` |
@@ -60,11 +61,12 @@ wraps to the first track, **loop 1** repeats the current track.
 
 ## The LCD panel
 
-One panel, one 2 px bezel, five bands:
+One panel, one 2 px bezel, six bands:
 
-1. **Matrix** — 17 dot rows: 8 for the scrolling title, 8 for the spectrum
-   analyzer, and one blank row as a buffer before the text. Dots are 3x3 px
-   with a 1 px gap (4 px pitch), which fits **94 columns** at every size step.
+1. **Matrix** — 18 dot rows: a blank row at the top, 8 for the scrolling title,
+   8 for the spectrum analyzer, and a blank row at the bottom, so the content
+   never touches the bezel. Dots are 3x3 px with a 1 px gap (4 px pitch), which
+   fits **94 columns** at every size step.
 2. **Info** — file name on the left, `0:28 / 2:12 MP3` on the right.
 3. **Load** — `LOAD FILE` and `LOAD FOLDER`.
 4. **Playlist** — a dark 2 px frame with a 5 px buffer, on a darker green than
@@ -73,16 +75,21 @@ One panel, one 2 px bezel, five bands:
    from the start. The playing track gets a dark bar so its light text stands
    out, and the view scrolls itself to keep that row visible. Prev/next always
    wrap around the list, regardless of the loop mode.
-5. **Icons** — size gauge, a backlight glyph that cycles the palette, then prev,
+5. **Seek** — a 4 px progress line in a 10 px band, sitting between the playlist
+   and the transport. Unheard is drawn in the unlit dot colour, played in the
+   ink colour, with a 4x10 px thumb on the boundary. Click anywhere to jump, or
+   drag the thumb: the bar follows the pointer and the time readout follows the
+   bar. One pixel of the line is one seek step.
+6. **Icons** — size gauge, a backlight glyph that cycles the palette, then prev,
    rewind, play, pause, stop, forward, next, loop, loop 1.
 
 Icons are crisp geometry (`FillRect` and `Polygon`), not dots, so they read as
 LCD segments rather than as pixel art.
 
-The client area is **400x226**: the playlist block added a band, so the window
-grew rather than squeezing the matrix.
-
-![at 4x](docs/v0.7-4x.png)
+The client area is **407x250**. The panel is inset by a 10 px margin of window
+background, and the dot field is inset a further 6 px inside the bezel (a 2 px
+bezel plus 4 px of green padding), so the display reads as a screen set into a
+case rather than filling the window edge to edge.
 
 ## The spectrum analyzer
 
