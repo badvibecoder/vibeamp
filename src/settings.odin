@@ -30,6 +30,8 @@ Settings :: struct {
 	version:      int,
 	scale:        int, // index into SIZE_STEPS
 	theme:        int, // index into THEMES
+	volume:       int, // 0..100
+	muted:        int, // 0 or 1
 	position:     f32, // seconds into last_track
 	mode:         Playlist_Mode,
 	folder_dir:   string, // last LOAD FOLDER choice
@@ -142,6 +144,11 @@ int_str :: proc(buf: []u8, v: int) -> string {
 }
 
 settings_load :: proc() {
+	// Defaults, so a missing key falls back to something sensible rather than
+	// to zero (volume in particular).
+	settings.volume = 50
+	settings.muted = 0
+
 	path := settings_path()
 	if len(path) == 0 {
 		return
@@ -191,6 +198,14 @@ settings_load :: proc() {
 			if n, ok := parse_int(val); ok {
 				settings.theme = n
 			}
+		case "volume":
+			if n, ok := parse_int(val); ok {
+				settings.volume = n
+			}
+		case "muted":
+			if n, ok := parse_int(val); ok {
+				settings.muted = n
+			}
 		case "position":
 			if n, ok := parse_int(val); ok {
 				settings.position = f32(n)
@@ -219,6 +234,11 @@ settings_capture :: proc() {
 	settings.version = SETTINGS_VERSION
 	settings.scale = g.scale_index
 	settings.theme = g.theme_index
+	settings.volume = int(g.volume*100 + 0.5)
+	settings.muted = 1
+	if !g.muted {
+		settings.muted = 0
+	}
 	settings.position = audio_position()
 	if g.track_loaded && library.index >= 0 && library.index < len(library.tracks) {
 		set_string(&settings.last_track, library.tracks[library.index])
@@ -245,6 +265,10 @@ settings_save :: proc() {
 	strings.write_string(&b, int_str(num[:], settings.scale))
 	strings.write_string(&b, "\ntheme=")
 	strings.write_string(&b, int_str(num[:], settings.theme))
+	strings.write_string(&b, "\nvolume=")
+	strings.write_string(&b, int_str(num[:], settings.volume))
+	strings.write_string(&b, "\nmuted=")
+	strings.write_string(&b, int_str(num[:], settings.muted))
 	strings.write_string(&b, "\nposition=")
 	strings.write_string(&b, int_str(num[:], int(settings.position)))
 	strings.write_string(&b, "\nmode=")
@@ -315,3 +339,4 @@ dir_exists :: proc(path: string) -> bool {
 	}
 	return (attrs & win.FILE_ATTRIBUTE_DIRECTORY) != 0
 }
+

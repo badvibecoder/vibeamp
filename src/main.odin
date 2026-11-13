@@ -5,12 +5,24 @@ import "core:strings"
 import win "core:sys/windows"
 
 // SetCapture/ReleaseCapture are missing from the shipped bindings.
-foreign import u32 "system:User32.lib"
+// (Named user32_lib, not u32: a foreign import named u32 would shadow the
+// builtin type.)
+foreign import user32_lib "system:User32.lib"
 
 @(default_calling_convention="system")
-foreign u32 {
+foreign user32_lib {
 	SetCapture     :: proc(hWnd: win.HWND) -> win.HWND ---
 	ReleaseCapture :: proc() -> win.BOOL ---
+}
+
+// IntersectClipRect is missing from the shipped bindings too.
+foreign import g32 "system:Gdi32.lib"
+
+@(default_calling_convention="system")
+foreign g32 {
+	IntersectClipRect   :: proc(hdc: win.HDC, left, top, right, bottom: win.INT) -> win.INT ---
+	CreatePatternBrush  :: proc(hbm: win.HBITMAP) -> win.HBRUSH ---
+	SetBrushOrgEx       :: proc(hdc: win.HDC, x, y: win.INT, lppt: ^win.POINT) -> win.BOOL ---
 }
 
 //
@@ -51,13 +63,18 @@ LCD_INFO_H   :: i32(9)
 LCD_LOAD_GAP :: i32(6)  // info line -> load controls
 LCD_LOAD_H   :: i32(10)
 LCD_ICON_GAP :: i32(4)  // seek band -> icon row
-LCD_ICON_H   :: i32(20)
+LCD_ICON_H   :: i32(20) // height of the icon row
+ICON_H       :: i32(16) // every icon in that row is this tall
 
 // Seek bar: a thin line with a draggable thumb, under the track info.
 SEEK_GAP   :: i32(4)  // buffer above and below the band
 SEEK_BAND  :: i32(10) // total band height
 SEEK_BAR_H :: i32(4)  // visible line thickness
 SEEK_THUMB :: i32(4)  // thumb width
+
+// The volume column takes this much off the right of the playlist and transport.
+// Big enough that the mute button can sit a full icon-gap after the transport.
+VOL_W :: i32(32)
 
 // Playlist block: a framed list of the loaded tracks, under the LOAD controls.
 PLAYLIST_ROWS   :: 6
@@ -70,6 +87,8 @@ MAX_COLS :: 256
 
 SCROLL_GAP_COLS     :: 12
 SCROLL_DOTS_PER_SEC :: f32(12)
+PLAYLIST_SCROLL_PPS :: i32(14) // px per second at 1x, for the selected row
+SPECTRUM_GAP :: i32(6)         // matrix -> size dots, in spectrum mode
 DEFAULT_MARQUEE     :: "Select File or Folder"
 
 // COLORREF is 0x00BBGGRR, not 0xRRGGBB.
@@ -155,13 +174,16 @@ Control :: enum u8 {
 	List_Row,
 	Theme,
 	Seek,
+	Volume_Track,
+	Volume_Mute,
+	Spectrum,
 }
 
 SIZE_CONTROLS := [3]Control{.Size_1, .Size_2, .Size_4}
-GAUGE_SIZES   := [3]i32{7, 11, 15}
+GAUGE_SIZES   := [3]i32{8, 12, 16} // the largest matches ICON_H
 
 TRANSPORT_WIDTHS   := [9]i32{18, 18, 14, 14, 14, 18, 18, 20, 20}
-TRANSPORT_HEIGHTS  := [9]i32{16, 16, 16, 16, 16, 16, 16, 13, 13}
+TRANSPORT_HEIGHTS  := [9]i32{16, 16, 16, 16, 16, 16, 16, 16, 16}
 TRANSPORT_CONTROLS := [9]Control{.Prev, .Rewind, .Play, .Pause, .Stop, .Forward, .Next, .Loop_All, .Loop_One}
 TRANSPORT_GAP      :: i32(10)
 
@@ -214,6 +236,29 @@ g: struct {
 	class_name:  win.wstring,
 	cursor_hand: win.HCURSOR,
 
+	volume:       f32, // 0..1
+	muted:        bool,
+	vol_dragging: bool,
+	pl_start:     f64, // when the selected row's marquee started
+	pl_overflow:  bool,
+	pl_frame:     int,
+	spectrum_mode: bool,
+	spec_frame:    int,
+	spec_rows:     int, // spectrum rows in the mode currently drawn
+
+	// Which bands need redrawing. The back buffer persists, so a paint only
+	// touches the parts that actually changed.
+	dirty:     bit_set[Part; u32],
+	dirty_all: bool,
+
+	// Dot glyph as a pattern brush, so a field or a column run is one fill.
+	dot_brush_lit:   win.HBRUSH,
+	dot_brush_unlit: win.HBRUSH,
+	dot_bmp_lit:     win.HBITMAP,
+	dot_bmp_unlit:   win.HBITMAP,
+	dot_brush_theme: int,
+	dot_brush_pitch: i32,
+
 	ctx: runtime.Context,
 }
 
@@ -246,6 +291,12 @@ Layout :: struct {
 
 	size_rects: [3]win.RECT,
 	color_btn:  win.RECT,
+	volume:     win.RECT,
+	vol_speaker: win.RECT,
+	vol_track:  win.RECT,
+	vol_mute:   win.RECT,
+	pl_text_x:     i32,
+	pl_text_right: i32,
 
 	prev:    win.RECT,
 	rewind:  win.RECT,
@@ -263,6 +314,7 @@ Layout :: struct {
 	hits:      [MAX_HITS]Hit,
 	hit_count: int,
 	cols:      int,
+	rows:      int,
 }
 
 rect :: #force_inline proc "contextless" (l, t, r, b: i32) -> win.RECT {
@@ -280,8 +332,34 @@ add_hit :: proc "contextless" (lay: ^Layout, r: win.RECT, control: Control, inde
 	}
 }
 
+// Height of the panel in both modes: the spectrum view keeps the same window
+// size, it just gives the matrix the space the other bands would have used.
+panel_height :: proc "contextless" (s: Scale, grid_h: i32) -> i32 {
+	border  := dm(s, LCD_BORDER)
+	lcd_pad := dm(s, LCD_PAD)
+	info_h  := dm(s, LCD_INFO_H)
+	load_h  := dm(s, LCD_LOAD_H)
+	icon_h  := dm(s, LCD_ICON_H)
+
+	pb := dm(s, PLAYLIST_BORDER)
+	pp := dm(s, PLAYLIST_PAD)
+	ph := dm(s, PLAYLIST_ROW_H)
+	playlist_h := 2*pb + 2*pp + i32(PLAYLIST_ROWS)*ph
+
+	return 2*(border + lcd_pad) + grid_h +
+		dm(s, LCD_INFO_GAP) + info_h +
+		dm(s, LCD_LOAD_GAP) + load_h +
+		dm(s, PLAYLIST_GAP) + playlist_h +
+		dm(s, SEEK_GAP) + dm(s, SEEK_BAND) +
+		dm(s, LCD_ICON_GAP) + icon_h
+}
+
 build_layout :: proc "contextless" (client_w: i32, s: Scale) -> Layout {
 	lay := Layout{}
+
+	if g.spectrum_mode {
+		return build_spectrum_layout(client_w, s)
+	}
 
 	dot    := dm(s, LCD_DOT)
 	gap    := dm(s, LCD_GAP)
@@ -324,14 +402,19 @@ build_layout :: proc "contextless" (client_w: i32, s: Scale) -> Layout {
 
 	top     := dm(s, LCD_MARGIN_TOP)
 	panel_w := grid_w + 2*(border + lcd_pad)
-	panel_h := 2*(border + lcd_pad) + grid_h + g_info + info_h + g_load + load_h + g_playlist + playlist_h + g_seek + seek_h + g_icon + icon_h
+	panel_h := panel_height(s, grid_h)
 
 	lay.panel = rect(margin, top, margin + panel_w, top + panel_h)
 	lay.cols  = int(cols)
+	lay.rows  = LCD_MATRIX_ROWS
 
 	ix := margin + border + lcd_pad
 	iy := top + border + lcd_pad
 	lay.grid = rect(ix, iy, ix + grid_w, iy + grid_h)
+
+	// The lower half gives up its right edge to the volume column.
+	vol_w     := dm(s, VOL_W)
+	content_w := grid_w - vol_w
 
 	y := iy + grid_h + g_info
 	lay.info = rect(ix, y, ix + grid_w, y + info_h)
@@ -341,25 +424,56 @@ build_layout :: proc "contextless" (client_w: i32, s: Scale) -> Layout {
 
 	// Playlist block: dark frame, darker infill, arrows on the right.
 	y += load_h + g_playlist
-	lay.playlist = rect(ix, y, ix + grid_w, y + playlist_h)
+	lay.playlist = rect(ix, y, ix + content_w, y + playlist_h)
 
 	arrow := dm(s, 12)
 	content_left := ix + pb + pp
 	content_top := y + pb + pp
-	content_right := ix + grid_w - pb - pp
+	content_right := ix + content_w - pb - pp
 	content_bottom := y + playlist_h - pb - pp
 	lay.arrow_up = rect(content_right - arrow, content_top, content_right, content_top + arrow)
 	lay.arrow_down = rect(content_right - arrow, content_bottom - arrow, content_right, content_bottom)
+	lay.pl_text_x = content_left
+	lay.pl_text_right = lay.arrow_up.left - dm(s, 4)
 
 	// Seek band sits between the playlist and the transport.
 	y += playlist_h + g_seek
-	lay.seek = rect(ix, y, ix + grid_w, y + seek_h)
+	lay.seek = rect(ix, y, ix + content_w, y + seek_h)
 
 	y += seek_h + g_icon
-	lay.icons = rect(ix, y, ix + grid_w, y + icon_h)
+	lay.icons = rect(ix, y, ix + content_w, y + icon_h)
 
-	// Size gauge, bottom aligned in the icon row.
-	bottom := lay.icons.bottom
+	// Volume column: speaker, vertical slider, mute. Spans the playlist top
+	// down to the bottom of the transport row.
+	lay.volume = rect(ix + content_w, lay.playlist.top, ix + grid_w, lay.icons.bottom)
+
+	icon_size := dm(s, ICON_H)
+	icon_top  := lay.icons.top + (icon_h - icon_size)/2
+	icon_bot  := icon_top + icon_size
+
+	// The stack is anchored on the mute button: it sits one icon gap after the
+	// transport, and the speaker and track are centred on it.
+	mute_w := dm(s, 18)
+	mute_x := lay.icons.right + dm(s, TRANSPORT_GAP)
+	lay.vol_mute = rect(mute_x, icon_top, mute_x + mute_w, icon_bot)
+
+	center := mute_x + mute_w/2
+
+	spk_w := dm(s, 16)
+	spk_x := center - spk_w/2
+	spk_y := lay.volume.top + dm(s, 4)
+	lay.vol_speaker = rect(spk_x, spk_y, spk_x + spk_w, spk_y + icon_size)
+
+	track_x := center - dm(s, 2)
+	lay.vol_track = rect(
+		track_x,
+		lay.vol_speaker.bottom + dm(s, 6),
+		track_x + dm(s, 4),
+		lay.vol_mute.top - dm(s, 6),
+	)
+
+	// Size gauge, sitting on the same baseline as the icons.
+	bottom := icon_bot
 	x := lay.icons.left
 	for v, i in GAUGE_SIZES {
 		sz := dm(s, v)
@@ -397,12 +511,14 @@ build_layout :: proc "contextless" (client_w: i32, s: Scale) -> Layout {
 		x += w + dm(s, TRANSPORT_GAP)
 	}
 
-	// Colour control: a backlight glyph, centred between the gauge and the
-	// transport, sized to match the stop icon.
-	icon_sz := dm(s, 16)
-	cx := gauge_end + ((transport_left - gauge_end) - icon_sz)/2
-	cy := lay.icons.top + (icon_h - icon_sz)/2
-	lay.color_btn = rect(cx, cy, cx + icon_sz, cy + icon_sz)
+	// LIGHT: a bordered text button in the load-control font, centred between
+	// the gauge and the transport.
+	light_w := small_text_width(s, "LIGHT")
+	btn_w := light_w + dm(s, 8)
+	btn_h := dm(s, 14)
+	cx := gauge_end + ((transport_left - gauge_end) - btn_w)/2
+	cy := lay.icons.top + (icon_h - btn_h)/2
+	lay.color_btn = rect(cx, cy, cx + btn_w, cy + btn_h)
 
 	// LOAD labels.
 	lx := lay.load.left
@@ -430,8 +546,14 @@ build_layout :: proc "contextless" (client_w: i32, s: Scale) -> Layout {
 	add_hit(&lay, rect_pad(lay.load_folder, dm(s, 2)), .Load_Folder)
 	add_hit(&lay, rect_pad(lay.color_btn, dm(s, 3)), .Theme)
 	add_hit(&lay, rect_pad(lay.seek, dm(s, 2)), .Seek)
+	add_hit(&lay, rect_pad(lay.vol_track, dm(s, 3)), .Volume_Track)
+	add_hit(&lay, rect_pad(lay.vol_mute, dm(s, 2)), .Volume_Mute)
 	add_hit(&lay, rect_pad(lay.arrow_up, dm(s, 3)), .List_Up)
 	add_hit(&lay, rect_pad(lay.arrow_down, dm(s, 3)), .List_Down)
+
+	// Clicking the analyzer's own rows opens the full-window spectrum view.
+	spectrum_top := lay.grid.top + i32(LCD_TOP_ROWS + LCD_ROWS)*pitch
+	add_hit(&lay, rect(lay.grid.left, spectrum_top, lay.grid.right, lay.grid.bottom), .Spectrum)
 
 	// One click target per visible playlist row.
 	row_right := i32(lay.arrow_up.left) - dm(s, 4)
@@ -444,6 +566,71 @@ build_layout :: proc "contextless" (client_w: i32, s: Scale) -> Layout {
 		add_hit(&lay, rect(content_left, ry, row_right, ry + ph), .List_Row, idx)
 	}
 
+	return lay
+}
+
+// Full-window spectrum view: the matrix takes everything the bands would have
+// used, with just the size dots left at the bottom.
+build_spectrum_layout :: proc "contextless" (client_w: i32, s: Scale) -> Layout {
+	lay := Layout{}
+
+	dot    := dm(s, LCD_DOT)
+	gap    := dm(s, LCD_GAP)
+	pitch  := dot + gap
+	margin := dm(s, LCD_MARGIN_X)
+	border := dm(s, LCD_BORDER)
+	lcd_pad := dm(s, LCD_PAD)
+
+	avail := client_w - 2*(margin + border + lcd_pad)
+	if pitch <= 0 || avail < dot {
+		return lay
+	}
+	cols := (avail + gap) / pitch
+	if cols > MAX_COLS {
+		cols = MAX_COLS
+	}
+	if cols < 1 {
+		return lay
+	}
+
+	grid_w := cols*pitch - gap
+	top := dm(s, LCD_MARGIN_TOP)
+	panel_w := grid_w + 2*(border + lcd_pad)
+	panel_h := panel_height(s, i32(LCD_MATRIX_ROWS)*pitch - gap)
+
+	lay.panel = rect(margin, top, margin + panel_w, top + panel_h)
+	lay.cols  = int(cols)
+
+	ix := margin + border + lcd_pad
+	iy := top + border + lcd_pad
+	content_bottom := top + panel_h - border - lcd_pad
+
+	icon_h := dm(s, LCD_ICON_H)
+	icon_top := content_bottom - icon_h
+	lay.icons = rect(ix, icon_top, ix + grid_w, content_bottom)
+
+	matrix_bottom := icon_top - dm(s, SPECTRUM_GAP)
+	rows := (matrix_bottom - iy + gap) / pitch
+	if rows < 1 {
+		rows = 1
+	}
+	lay.rows = int(rows)
+	lay.grid = rect(ix, iy, ix + grid_w, iy + rows*pitch - gap)
+
+	// Size squares, on the same baseline as the normal view.
+	icon_size := dm(s, ICON_H)
+	gauge_bottom := icon_top + (icon_h - icon_size)/2 + icon_size
+	x := ix
+	for v, i in GAUGE_SIZES {
+		sz := dm(s, v)
+		lay.size_rects[i] = rect(x, gauge_bottom - sz, x + sz, gauge_bottom)
+		x += sz + dm(s, 5)
+	}
+
+	add_hit(&lay, lay.grid, .Spectrum)
+	for i in 0 ..< 3 {
+		add_hit(&lay, rect_pad(lay.size_rects[i], dm(s, 3)), SIZE_CONTROLS[i])
+	}
 	return lay
 }
 
@@ -496,8 +683,17 @@ main :: proc() {
 	if settings.theme >= 0 && settings.theme < len(THEMES) {
 		g.theme_index = settings.theme
 	}
+	g.volume = f32(settings.volume)/100
+	if g.volume < 0 {
+		g.volume = 0
+	}
+	if g.volume > 1 {
+		g.volume = 1
+	}
+	g.muted = settings.muted != 0
 
 	audio_init()
+	volume_apply()
 	spectrum_init()
 	set_marquee(DEFAULT_MARQUEE)
 
@@ -622,12 +818,26 @@ window_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM,
 			invalidate(hwnd)
 			return 0
 		}
+		if g.vol_dragging {
+			y := i32(i16(u16((lparam >> 16) & 0xFFFF)))
+			g.volume = volume_at(hwnd, y)
+			volume_apply()
+			invalidate(hwnd)
+			return 0
+		}
 
 	case win.WM_LBUTTONUP:
 		if g.seeking {
 			g.seeking = false
 			audio_seek(g.seek_preview)
 			win.ReleaseCapture()
+			invalidate(hwnd)
+			return 0
+		}
+		if g.vol_dragging {
+			g.vol_dragging = false
+			win.ReleaseCapture()
+			settings_save()
 			invalidate(hwnd)
 			return 0
 		}
@@ -661,6 +871,7 @@ window_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM,
 			)
 		}
 		win.InvalidateRect(hwnd, nil, true)
+		g.dirty_all = true
 		return 0
 
 	case win.WM_DESTROY:
@@ -708,6 +919,13 @@ tick :: proc (hwnd: win.HWND) {
 		}
 	}
 
+	// The 60 Hz timer is twice what the display needs; analyse and paint at 30.
+	frame := int(now*30)
+	if frame == g.spec_frame {
+		return
+	}
+	g.spec_frame = frame
+
 	// Persist the position periodically, so a kill or crash loses at most a
 	// few seconds of progress.
 	if g.playback == .Playing && now - g.last_save >= 5.0 {
@@ -730,7 +948,16 @@ tick :: proc (hwnd: win.HWND) {
 	spectrum_update(g.cols, dt, g.playback == .Playing)
 	build_info_text()
 
-	changed := false
+	dirty: bit_set[Part; u32]
+
+	// A long name in the playing row scrolls between the marquee's own steps.
+	if g.pl_overflow {
+		frame := int(now*20)
+		if frame != g.pl_frame {
+			g.pl_frame = frame
+			dirty |= {.Playlist_Row}
+		}
+	}
 
 	// The idle scene animates on its own, faster than the marquee steps.
 	idle_frame := 0
@@ -738,33 +965,47 @@ tick :: proc (hwnd: win.HWND) {
 		idle_frame = int(now*20)
 	}
 	if idle_frame != g.painted_idle {
-		changed = true
+		dirty |= {.Matrix}
 		g.painted_idle = idle_frame
 	}
 
 	col   := int(g.scroll)
 	flash := g.playback == .Paused && flash_on(now)
 	sec   := int(audio_position())
-	if col != g.painted_col || flash != g.painted_flash || sec != g.painted_second {
-		changed = true
-		g.painted_col    = col
-		g.painted_flash  = flash
+	if col != g.painted_col {
+		dirty |= {.Matrix}
+		g.painted_col = col
+	}
+	if flash != g.painted_flash {
+		dirty |= {.Icons}
+		g.painted_flash = flash
+	}
+	if sec != g.painted_second {
+		// The seek bar tracks the position, so it moves with the clock too.
+		dirty |= {.Info, .Seek}
 		g.painted_second = sec
 	}
 
+	// Bars are stored in rows of the current mode, so a repaint only happens
+	// when the drawn height actually changes.
+	rows := g.spec_rows
+	if rows < 1 {
+		rows = LCD_SPEC_ROWS
+	}
 	for x in 0 ..< g.cols {
-		height := u8(f32(LCD_SPEC_ROWS)*spectrum.levels[x] + 0.5)
-		if height > LCD_SPEC_ROWS {
-			height = LCD_SPEC_ROWS
+		h := u8(f32(rows)*spectrum.levels[x] + 0.5)
+		if h > u8(rows) {
+			h = u8(rows)
 		}
-		g.bars[x] = height
-		if height != g.painted_bars[x] {
-			changed = true
-			g.painted_bars[x] = height
+		g.bars[x] = h
+		if h != g.painted_bars[x] {
+			dirty |= {.Matrix}
+			g.painted_bars[x] = h
 		}
 	}
 
-	if changed {
+	if dirty != {} {
+		g.dirty |= dirty
 		win.InvalidateRect(hwnd, nil, false)
 	}
 }
@@ -821,6 +1062,9 @@ put_clock :: proc "contextless" (b: []u8, n: int, secs: f32) -> int {
 //
 
 on_key :: proc (hwnd: win.HWND, vk: int) {
+	// High bit set means the key is down.
+	ctrl := win.GetKeyState(win.VK_CONTROL) < 0
+
 	switch {
 	case vk == win.VK_OEM_PLUS || vk == win.VK_ADD:
 		set_scale(hwnd, g.scale_index + 1)
@@ -835,8 +1079,72 @@ on_key :: proc (hwnd: win.HWND, vk: int) {
 	case vk == win.VK_S:
 		transport_stop(hwnd)
 	case vk == win.VK_L:
-		cycle_loop(hwnd)
+		if ctrl {
+			// Ctrl+L: loop the current file only.
+			if g.loop_mode == .One {
+				g.loop_mode = .Off
+			} else {
+				g.loop_mode = .One
+			}
+		} else {
+			// L: loop the whole list.
+			if g.loop_mode == .All {
+				g.loop_mode = .Off
+			} else {
+				g.loop_mode = .All
+			}
+		}
+		audio_set_looping(g.loop_mode == .One)
+		invalidate(hwnd)
+	case vk == win.VK_UP:
+		step_track(hwnd, -1)
+	case vk == win.VK_DOWN:
+		step_track(hwnd, 1)
+	case vk == win.VK_LEFT:
+		transport_seek(hwnd, -5)
+	case vk == win.VK_RIGHT:
+		transport_seek(hwnd, 5)
+	case vk == win.VK_PRIOR:
+		volume_step(hwnd, 0.05)
+	case vk == win.VK_NEXT:
+		volume_step(hwnd, -0.05)
+	case vk == win.VK_C:
+		cycle_theme(hwnd)
+	case vk == win.VK_M:
+		g.muted = !g.muted
+		volume_apply()
+		settings_save()
+		invalidate(hwnd)
+	case vk == win.VK_ESCAPE:
+		if g.spectrum_mode {
+			g.spectrum_mode = false
+			invalidate(hwnd)
+		}
+	case vk == win.VK_O:
+		if ctrl {
+			load_file_dialog(hwnd)
+		}
+	case vk == win.VK_F:
+		if ctrl {
+			load_folder_dialog(hwnd)
+		}
 	}
+}
+
+// Keyboard volume step: always comes off mute, like dragging the slider.
+volume_step :: proc (hwnd: win.HWND, delta: f32) {
+	v := g.volume + delta
+	if v < 0 {
+		v = 0
+	}
+	if v > 1 {
+		v = 1
+	}
+	g.volume = v
+	g.muted = false
+	volume_apply()
+	settings_save()
+	invalidate(hwnd)
 }
 
 on_click :: proc (hwnd: win.HWND, lparam: win.LPARAM) {
@@ -897,6 +1205,21 @@ on_click :: proc (hwnd: win.HWND, lparam: win.LPARAM) {
 		g.last_seek = clock_seconds()
 		win.SetCapture(hwnd)
 		invalidate(hwnd)
+	case .Volume_Track:
+		g.vol_dragging = true
+		g.muted = false
+		g.volume = volume_at(hwnd, y)
+		volume_apply()
+		win.SetCapture(hwnd)
+		invalidate(hwnd)
+	case .Volume_Mute:
+		g.muted = !g.muted
+		volume_apply()
+		settings_save()
+		invalidate(hwnd)
+	case .Spectrum:
+		g.spectrum_mode = !g.spectrum_mode
+		invalidate(hwnd)
 	}
 }
 
@@ -922,8 +1245,27 @@ scroll_list :: proc (hwnd: win.HWND, delta: int) {
 // Transport
 //
 
+// The window is painted band by band, and only the bands that changed are
+// redrawn into the persistent back buffer.
+Part :: enum {
+	Matrix,
+	Info,
+	Load,
+	Playlist,
+	Playlist_Row, // just the playing row, for its scrolling name
+	Seek,
+	Icons,
+	Volume,
+}
+
 invalidate :: #force_inline proc (hwnd: win.HWND) {
+	g.dirty_all = true
 	win.InvalidateRect(hwnd, nil, true)
+}
+
+invalidate_part :: #force_inline proc (hwnd: win.HWND, part: Part) {
+	g.dirty |= {part}
+	win.InvalidateRect(hwnd, nil, false)
 }
 
 transport_play :: proc (hwnd: win.HWND) {
@@ -1031,6 +1373,7 @@ load_current :: proc (hwnd: win.HWND, play_now := true, at := f32(0)) {
 	}
 	g.track_loaded = true
 	g.track_name   = library.names[library.index]
+	g.pl_start     = clock_seconds()
 	set_marquee(g.track_name)
 	audio_set_looping(g.loop_mode == .One)
 
@@ -1066,10 +1409,12 @@ restore_session :: proc (hwnd: win.HWND) {
 			return
 		}
 		if library_load_folder(settings.playlist_dir) == 0 {
+			invalidate(hwnd)
 			return
 		}
 		// The playlist is back even if the exact track has been deleted.
 		if !path_exists(settings.last_track) {
+			invalidate(hwnd)
 			return
 		}
 		idx := -1
@@ -1080,6 +1425,7 @@ restore_session :: proc (hwnd: win.HWND) {
 			}
 		}
 		if idx < 0 {
+			invalidate(hwnd)
 			return
 		}
 		library.index = idx
@@ -1149,6 +1495,8 @@ load_folder_dialog :: proc (hwnd: win.HWND) {
 		return
 	}
 	if library_load_folder(dir) == 0 {
+		// library_load_folder clears the list first, so the panel is stale now.
+		invalidate(hwnd)
 		return
 	}
 	set_string(&settings.folder_dir, dir)
@@ -1177,31 +1525,373 @@ paint :: proc "contextless" (hwnd: win.HWND) {
 		return
 	}
 
-	ensure_back_buffer(hdc, w, h)
+	// A fresh or resized buffer holds nothing, so it needs a full repaint.
+	if ensure_back_buffer(hdc, w, h) {
+		g.dirty_all = true
+	}
 	dc := g.buf_dc
-
-	win.FillRect(dc, &client, g.brush_background)
 
 	s   := Scale{dpi = win.GetDpiForWindow(hwnd), step = current_step()}
 	lay := build_layout(w, s)
 	g.cols = lay.cols
-	draw_panel(dc, &lay, s, clock_seconds())
+	g.spec_rows = LCD_SPEC_ROWS
+	if g.spectrum_mode {
+		g.spec_rows = lay.rows
+	}
+
+	now := clock_seconds()
+	if g.dirty_all {
+		win.FillRect(dc, &client, g.brush_background)
+		win.FillRect(dc, &lay.panel, g.brush_lcd_panel)
+		draw_panel_all(dc, &lay, s, now)
+		g.dirty_all = false
+		g.dirty = {}
+	} else if g.dirty != {} {
+		draw_panel_parts(dc, &lay, s, now, g.dirty)
+		g.dirty = {}
+	}
 
 	win.BitBlt(hdc, 0, 0, win.INT(w), win.INT(h), dc, 0, 0, win.SRCCOPY)
 }
 
-draw_panel :: proc "contextless" (dc: win.HDC, lay: ^Layout, s: Scale, now: f64) {
-	win.FillRect(dc, &lay.panel, g.brush_lcd_panel)
+// Vertical volume column: speaker at the top, slider in the middle, mute at the
+// bottom. The slider is the seek bar rotated: light above the level, ink below.
+draw_volume :: proc "contextless" (dc: win.HDC, lay: ^Layout, s: Scale) {
+	win.FillRect(dc, &lay.volume, g.brush_lcd_panel)
+	ink := g.brush_lcd_lit
+
+	// Speaker, with waves showing the level.
+	draw_speaker(dc, lay.vol_speaker, ink)
+	draw_volume_waves(dc, lay.vol_speaker, s, ink)
+
+	tr := lay.vol_track
+	tw := tr.right - tr.left
+	th := tr.bottom - tr.top
+	if tw > 0 && th > 0 {
+		lev := g.volume
+		if g.muted {
+			lev = 0
+		}
+		if lev < 0 {
+			lev = 0
+		}
+		if lev > 1 {
+			lev = 1
+		}
+		filled := i32(f32(th)*lev + 0.5)
+
+		fill_rect(dc, tr.left, tr.top, tw, th, g.brush_lcd_unlit)
+		if filled > 0 {
+			fill_rect(dc, tr.left, tr.bottom - filled, tw, filled, ink)
+		}
+
+		// Thumb: the seek bar's 4x10 rotated to 10x4.
+		thumb_w := dm(s, 10)
+		thumb_h := dm(s, 4)
+		ty := tr.bottom - filled - thumb_h/2
+		if ty < tr.top {
+			ty = tr.top
+		}
+		if ty + thumb_h > tr.bottom {
+			ty = tr.bottom - thumb_h
+		}
+		tx := tr.left + tw/2 - thumb_w/2
+		fill_rect(dc, tx, ty, thumb_w, thumb_h, ink)
+	}
+
+	// Mute button: speaker with a cross.
+	m := lay.vol_mute
+	draw_speaker(dc, m, ink)
+	cx0 := m.left + dm(s, 10)
+	cy0 := m.top + dm(s, 5)
+	cx1 := cx0 + dm(s, 6)
+	cy1 := cy0 + dm(s, 6)
+	pen := win.CreatePen(0, dm(s, 1), THEMES[g.theme_index].lit)
+	if pen != nil {
+		old := win.SelectObject(dc, win.HGDIOBJ(pen))
+		win.MoveToEx(dc, cx0, cy0, nil)
+		win.LineTo(dc, cx1, cy1)
+		win.MoveToEx(dc, cx1, cy0, nil)
+		win.LineTo(dc, cx0, cy1)
+		win.SelectObject(dc, old)
+		win.DeleteObject(win.HGDIOBJ(pen))
+	}
+}
+
+// Speaker silhouette, scaled to the height of `r`.
+draw_speaker :: proc "contextless" (dc: win.HDC, r: win.RECT, brush: win.HBRUSH) {
+	h := r.bottom - r.top
+	if h <= 0 {
+		return
+	}
+	u := h/16
+	if u < 1 {
+		u = 1
+	}
+	x := r.left
+	y := r.top
+	fill_rect(dc, x, y + 5*u, 3*u, 6*u, brush)
+	fill_quad(dc, [4]win.POINT {
+		{x + 3*u, y + 5*u},
+		{x + 8*u, y + 2*u},
+		{x + 8*u, y + 14*u},
+		{x + 3*u, y + 11*u},
+	}, brush)
+}
+
+// Level meter beside the speaker: a wave per third, and a bigger one at full.
+draw_volume_waves :: proc "contextless" (dc: win.HDC, r: win.RECT, s: Scale, brush: win.HBRUSH) {
+	u := (r.bottom - r.top)/16
+	if u < 1 {
+		u = 1
+	}
+	x := r.left + 9*u
+	y := r.top
+
+	vol := g.volume
+	if g.muted {
+		vol = 0
+	}
+
+	n := 0
+	if vol > 0.02 {
+		n = 1
+	}
+	if vol > 0.34 {
+		n = 2
+	}
+	if vol > 0.67 {
+		n = 3
+	}
+
+	heights := [3]i32{4, 7, 10}
+	for i in 0 ..< n {
+		bh := heights[i]*u
+		by := y + (16*u - bh)/2
+		fill_rect(dc, x + i32(i)*2*u, by, u, bh, brush)
+	}
+
+	if vol >= 0.99 {
+		bh := i32(15)*u
+		by := y + (16*u - bh)/2
+		fill_rect(dc, x + 6*u, by, u, bh, brush)
+	}
+}
+
+fill_quad :: proc "contextless" (dc: win.HDC, pts: [4]win.POINT, brush: win.HBRUSH) {
+	p := pts
+	old_brush := win.SelectObject(dc, win.HGDIOBJ(brush))
+	old_pen   := win.SelectObject(dc, win.GetStockObject(win.NULL_PEN))
+	win.Polygon(dc, &p[0], 4)
+	win.SelectObject(dc, old_pen)
+	win.SelectObject(dc, old_brush)
+}
+
+draw_panel_all :: proc "contextless" (dc: win.HDC, lay: ^Layout, s: Scale, now: f64) {
+	// Spectrum mode: the matrix takes the whole panel, only the dots remain.
+	if g.spectrum_mode {
+		draw_matrix(dc, lay, s, now)
+		draw_size_gauge(dc, lay, s)
+		return
+	}
+
 	draw_matrix(dc, lay, s, now)
 	draw_info_row(dc, lay, s)
 	draw_seek(dc, lay, s)
 	draw_load_row(dc, lay, s)
-	draw_playlist(dc, lay, s)
+	draw_playlist(dc, lay, s, now, 0, PLAYLIST_ROWS)
 	draw_icons(dc, lay, s, now)
+	draw_volume(dc, lay, s)
+}
+
+// Repaints only the bands in `parts`, leaving the rest of the back buffer as is.
+draw_panel_parts :: proc "contextless" (dc: win.HDC, lay: ^Layout, s: Scale, now: f64, parts: bit_set[Part; u32]) {
+	if g.spectrum_mode {
+		if .Matrix in parts {
+			draw_matrix(dc, lay, s, now)
+		}
+		if .Icons in parts {
+			win.FillRect(dc, &lay.icons, g.brush_lcd_panel)
+			draw_size_gauge(dc, lay, s)
+		}
+		// The playlist is not on screen, so its marquee must not drive repaints.
+		g.pl_overflow = false
+		return
+	}
+
+	if .Matrix in parts {
+		draw_matrix(dc, lay, s, now)
+	}
+	if .Info in parts {
+		draw_info_row(dc, lay, s)
+	}
+	if .Seek in parts {
+		draw_seek(dc, lay, s)
+	}
+	if .Load in parts {
+		draw_load_row(dc, lay, s)
+	}
+	if .Playlist in parts {
+		draw_playlist(dc, lay, s, now, 0, PLAYLIST_ROWS)
+	} else if .Playlist_Row in parts {
+		row := library.index - g.list_scroll
+		if row >= 0 && row < PLAYLIST_ROWS {
+			draw_playlist(dc, lay, s, now, row, 1)
+		}
+	}
+	if .Icons in parts {
+		draw_icons(dc, lay, s, now)
+	}
+	if .Volume in parts {
+		draw_volume(dc, lay, s)
+	}
 }
 
 // The whole matrix: marquee rows on top, spectrum bars under them, then one
 // blank buffer row. All of it is the same dot field.
+// A COLORREF is 0x00BBGGRR; a 32bpp DIB pixel is 0x00RRGGBB.
+dib_pixel :: #force_inline proc "contextless" (c: win.COLORREF) -> u32 {
+	return (u32(c & 0xFF) << 16) | (u32((c >> 8) & 0xFF) << 8) | u32((c >> 16) & 0xFF)
+}
+
+// Builds a tiled dot pattern as a brush: one dot on the panel colour, repeated
+// every `pitch`. GDI wants at least 8x8, so small pitches are tiled into it.
+dot_pattern :: proc "contextless" (pitch, dot: i32, bg, fg: win.COLORREF) -> (win.HBRUSH, win.HBITMAP) {
+	if pitch <= 0 || dot <= 0 {
+		return nil, nil
+	}
+	size := pitch
+	if size < 8 {
+		size = 8
+	}
+
+	dc := win.CreateCompatibleDC(nil)
+	if dc == nil {
+		return nil, nil
+	}
+	defer win.DeleteDC(dc)
+
+	bmi: win.BITMAPINFO
+	bmi.bmiHeader.biSize        = u32(size_of(win.BITMAPINFOHEADER))
+	bmi.bmiHeader.biWidth       = size
+	bmi.bmiHeader.biHeight      = -size
+	bmi.bmiHeader.biPlanes      = 1
+	bmi.bmiHeader.biBitCount    = 32
+	bmi.bmiHeader.biCompression = 0
+
+	bits: rawptr
+	bmp := win.CreateDIBSection(dc, &bmi, 0, &bits, nil, 0)
+	if bmp == nil || bits == nil {
+		return nil, nil
+	}
+
+	px := cast([^]u32) bits
+	back := dib_pixel(bg)
+	fore := dib_pixel(fg)
+	for y in 0 ..< size {
+		for x in 0 ..< size {
+			c := back
+			if (x % pitch) < dot && (y % pitch) < dot {
+				c = fore
+			}
+			px[y*size + x] = c
+		}
+	}
+
+	brush := CreatePatternBrush(bmp)
+	if brush == nil {
+		win.DeleteObject(win.HGDIOBJ(bmp))
+		return nil, nil
+	}
+	return brush, bmp
+}
+
+destroy_dot_brushes :: proc "contextless" () {
+	if g.dot_brush_lit != nil {
+		win.DeleteObject(win.HGDIOBJ(g.dot_brush_lit))
+		g.dot_brush_lit = nil
+	}
+	if g.dot_brush_unlit != nil {
+		win.DeleteObject(win.HGDIOBJ(g.dot_brush_unlit))
+		g.dot_brush_unlit = nil
+	}
+	if g.dot_bmp_lit != nil {
+		win.DeleteObject(win.HGDIOBJ(g.dot_bmp_lit))
+		g.dot_bmp_lit = nil
+	}
+	if g.dot_bmp_unlit != nil {
+		win.DeleteObject(win.HGDIOBJ(g.dot_bmp_unlit))
+		g.dot_bmp_unlit = nil
+	}
+	g.dot_brush_theme = -1
+	g.dot_brush_pitch = 0
+}
+
+ensure_dot_brushes :: proc "contextless" (s: Scale) {
+	pitch := dm(s, LCD_DOT) + dm(s, LCD_GAP)
+	if g.dot_brush_lit != nil && g.dot_brush_unlit != nil &&
+	   g.dot_brush_theme == g.theme_index && g.dot_brush_pitch == pitch {
+		return
+	}
+	destroy_dot_brushes()
+
+	t := THEMES[g.theme_index]
+	dot := dm(s, LCD_DOT)
+	g.dot_brush_lit, g.dot_bmp_lit = dot_pattern(pitch, dot, t.panel, t.lit)
+	g.dot_brush_unlit, g.dot_bmp_unlit = dot_pattern(pitch, dot, t.panel, t.unlit)
+	g.dot_brush_theme = g.theme_index
+	g.dot_brush_pitch = pitch
+}
+
+// Shared per-column state for the dot field, so both the batched and the
+// fallback paths agree on which dots are lit.
+Matrix_Ctx :: struct {
+	spectrum:  bool,
+	idle:      bool,
+	now:       f64,
+	cols:      int,
+	rows:      int,
+	spec_rows: int,
+	columns:   [MAX_COLS]u8,
+	bar_rows:  [MAX_COLS]i32,
+}
+
+matrix_lit :: #force_inline proc "contextless" (m: ^Matrix_Ctx, x, row: int) -> bool {
+	if m.spectrum {
+		if m.idle {
+			return idle_lit(x, row, m.cols, m.rows, m.now)
+		}
+		return row >= m.spec_rows - int(m.bar_rows[x])
+	}
+
+	content := row - LCD_TOP_ROWS
+	switch {
+	case content < 0 || content >= LCD_ROWS + LCD_SPEC_ROWS:
+		return false
+	case content < LCD_ROWS:
+		return is_lit(m.columns[x], content)
+	}
+	at := content - LCD_ROWS
+	if m.idle {
+		return idle_lit(x, at, m.cols, m.spec_rows, m.now)
+	}
+	return at >= m.spec_rows - int(m.bar_rows[x])
+}
+
+// One fill for a vertical run of lit dots. The pattern tiles from the grid
+// origin, so the run lines up with the rest of the field.
+fill_dot_run :: #force_inline proc "contextless" (
+	dc: win.HDC, gx, gy: i32, x: int, r0, r1: int, pitch, dot, gap: i32, brush: win.HBRUSH,
+) {
+	r := win.RECT {
+		left   = gx + i32(x)*pitch,
+		top    = gy + i32(r0)*pitch,
+		right  = gx + i32(x)*pitch + dot,
+		bottom = gy + i32(r1+1)*pitch - gap,
+	}
+	win.FillRect(dc, &r, brush)
+}
+
 draw_matrix :: proc "contextless" (dc: win.HDC, lay: ^Layout, s: Scale, now: f64) {
 	dot   := dm(s, LCD_DOT)
 	gap   := dm(s, LCD_GAP)
@@ -1210,43 +1900,77 @@ draw_matrix :: proc "contextless" (dc: win.HDC, lay: ^Layout, s: Scale, now: f64
 	gy    := lay.grid.top
 
 	n := lay.cols
-	base := int(g.scroll)
-
-	columns: [MAX_COLS]u8
-	for x in 0 ..< n {
-		columns[x] = message_column(base + x)
+	if n > MAX_COLS {
+		n = MAX_COLS
 	}
 
-	idle := idle_active(now)
+	spec_rows := LCD_SPEC_ROWS
+	if g.spectrum_mode {
+		spec_rows = lay.rows
+	}
 
-	for row in 0 ..< LCD_MATRIX_ROWS {
-		content := row - LCD_TOP_ROWS
-		for x in 0 ..< n {
-			lit := false
-			switch {
-			case content < 0 || content >= LCD_ROWS + LCD_SPEC_ROWS:
-				// Buffer rows stay blank.
-			case content < LCD_ROWS:
-				lit = is_lit(columns[x], content)
-			case:
-				at := content - LCD_ROWS
-				if idle {
-					lit = idle_lit(x, at, n, now)
-				} else {
-					lit = at >= LCD_SPEC_ROWS - int(g.bars[x])
+	m: Matrix_Ctx
+	m.spectrum  = g.spectrum_mode
+	m.idle      = idle_active(now)
+	m.now       = now
+	m.cols      = n
+	m.rows      = lay.rows
+	m.spec_rows = spec_rows
+
+	base := int(g.scroll)
+	for x in 0 ..< n {
+		m.columns[x]  = message_column(base + x)
+		m.bar_rows[x] = i32(g.bars[x])
+		if m.bar_rows[x] > i32(spec_rows) {
+			m.bar_rows[x] = i32(spec_rows)
+		}
+		// A loaded track always shows a baseline, so mute reads as a flat line
+		// rather than an empty display.
+		if !m.idle && m.bar_rows[x] < 1 {
+			m.bar_rows[x] = 1
+		}
+	}
+
+	ensure_dot_brushes(s)
+	batched := g.dot_brush_lit != nil && g.dot_brush_unlit != nil
+
+	if batched {
+		// The whole unlit field in one patterned fill.
+		SetBrushOrgEx(dc, gx, gy, nil)
+		win.FillRect(dc, &lay.grid, g.dot_brush_unlit)
+	}
+
+	for x in 0 ..< n {
+		if !batched {
+			for row in 0 ..< lay.rows {
+				brush := g.brush_lcd_unlit
+				if matrix_lit(&m, x, row) {
+					brush = g.brush_lcd_lit
 				}
+				fill_rect(dc, gx + i32(x)*pitch, gy + i32(row)*pitch, dot, dot, brush)
 			}
+			continue
+		}
 
-			brush := g.brush_lcd_unlit
-			if lit {
-				brush = g.brush_lcd_lit
+		run := -1
+		for row in 0 ..< lay.rows {
+			if matrix_lit(&m, x, row) {
+				if run < 0 {
+					run = row
+				}
+			} else if run >= 0 {
+				fill_dot_run(dc, gx, gy, x, run, row-1, pitch, dot, gap, g.dot_brush_lit)
+				run = -1
 			}
-			fill_rect(dc, gx + i32(x)*pitch, gy + i32(row)*pitch, dot, dot, brush)
+		}
+		if run >= 0 {
+			fill_dot_run(dc, gx, gy, x, run, lay.rows-1, pitch, dot, gap, g.dot_brush_lit)
 		}
 	}
 }
 
 draw_info_row :: proc "contextless" (dc: win.HDC, lay: ^Layout, s: Scale) {
+	win.FillRect(dc, &lay.info, g.brush_lcd_panel)
 	ink := g.brush_lcd_lit
 
 	name := g.track_name
@@ -1277,6 +2001,7 @@ draw_info_row :: proc "contextless" (dc: win.HDC, lay: ^Layout, s: Scale) {
 
 // Progress line: light for unheard, dark for played, with a draggable thumb.
 draw_seek :: proc "contextless" (dc: win.HDC, lay: ^Layout, s: Scale) {
+	win.FillRect(dc, &lay.seek, g.brush_lcd_panel)
 	band_h  := dm(s, SEEK_BAND)
 	bar_h   := dm(s, SEEK_BAR_H)
 	thumb_w := dm(s, SEEK_THUMB)
@@ -1324,6 +2049,38 @@ draw_seek :: proc "contextless" (dc: win.HDC, lay: ^Layout, s: Scale) {
 	fill_rect(dc, tx, lay.seek.top, thumb_w, band_h, g.brush_lcd_lit)
 }
 
+// Maps a client y to a volume 0..1 along the vertical track.
+volume_at :: proc "contextless" (hwnd: win.HWND, y: i32) -> f32 {
+	client: win.RECT
+	if !bool(win.GetClientRect(hwnd, &client)) {
+		return g.volume
+	}
+	s := Scale{dpi = win.GetDpiForWindow(hwnd), step = current_step()}
+	lay := build_layout(client.right - client.left, s)
+
+	tr := lay.vol_track
+	h := tr.bottom - tr.top
+	if h <= 0 {
+		return g.volume
+	}
+	f := f32(tr.bottom - y)/f32(h)
+	if f < 0 {
+		f = 0
+	}
+	if f > 1 {
+		f = 1
+	}
+	return f
+}
+
+volume_apply :: proc "contextless" () {
+	if g.muted {
+		audio_set_volume(0)
+	} else {
+		audio_set_volume(g.volume)
+	}
+}
+
 // Maps a client x to a time in the current track, pixel by pixel.
 seek_time_at :: proc "contextless" (hwnd: win.HWND, x: i32) -> f32 {
 	if audio.duration <= 0.0 {
@@ -1350,6 +2107,7 @@ seek_time_at :: proc "contextless" (hwnd: win.HWND, x: i32) -> f32 {
 }
 
 draw_load_row :: proc "contextless" (dc: win.HDC, lay: ^Layout, s: Scale) {
+	win.FillRect(dc, &lay.load, g.brush_lcd_panel)
 	ink := g.brush_lcd_lit
 	y := lay.load.top + dm(s, 1)
 	draw_small_text(dc, lay.load_file.left, y, s, "LOAD FILE", ink)
@@ -1357,7 +2115,7 @@ draw_load_row :: proc "contextless" (dc: win.HDC, lay: ^Layout, s: Scale) {
 }
 
 // The playlist: a dark frame, a darker-green infill, light-green lines.
-draw_playlist :: proc "contextless" (dc: win.HDC, lay: ^Layout, s: Scale) {
+draw_playlist :: proc "contextless" (dc: win.HDC, lay: ^Layout, s: Scale, now: f64, first: int, count: int) {
 	pb := dm(s, PLAYLIST_BORDER)
 	pp := dm(s, PLAYLIST_PAD)
 	row_h := dm(s, PLAYLIST_ROW_H)
@@ -1367,90 +2125,115 @@ draw_playlist :: proc "contextless" (dc: win.HDC, lay: ^Layout, s: Scale) {
 	r := i32(lay.playlist.right)
 	b := i32(lay.playlist.bottom)
 
-	// Dark frame, then the infill inside it.
-	win.FillRect(dc, &lay.playlist, g.brush_lcd_lit)
-	inner := rect(l + pb, t + pb, r - pb, b - pb)
-	win.FillRect(dc, &inner, g.brush_list_bg)
-
-	text_x := l + pb + pp
+	text_x := lay.pl_text_x
 	text_top := t + pb + pp
-	text_right := i32(lay.arrow_up.left) - dm(s, 4)
+	text_right := lay.pl_text_right
+	avail := text_right - text_x
+
+	full := first == 0 && count >= PLAYLIST_ROWS
+	if full {
+		// Dark frame, then the infill inside it.
+		win.FillRect(dc, &lay.playlist, g.brush_lcd_lit)
+		inner := rect(l + pb, t + pb, r - pb, b - pb)
+		win.FillRect(dc, &inner, g.brush_list_bg)
+	} else {
+		// Partial repaint: clear just the rows being redrawn, stopping short of
+		// the arrow column so the arrows survive.
+		for k in 0 ..< count {
+			row_top := text_top + i32(first + k)*row_h
+			band := rect(l + pb, row_top, lay.arrow_up.left, row_top + row_h)
+			win.FillRect(dc, &band, g.brush_list_bg)
+		}
+	}
 
 	cell := dm(s, 6)
 	max_chars := 0
 	if cell > 0 {
-		max_chars = int((text_right - text_x) / cell)
+		max_chars = int(avail / cell)
 	}
 
-	for i in 0 ..< PLAYLIST_ROWS {
+	g.pl_overflow = false
+
+	for k in 0 ..< count {
+		i := first + k
 		idx := g.list_scroll + i
 		if idx >= len(library.names) {
 			break
 		}
 
 		row_top := text_top + i32(i)*row_h
+		selected := g.track_loaded && idx == library.index
 
 		// The playing track gets a dark bar so the light text pops.
-		if g.track_loaded && idx == library.index {
+		if selected {
 			fill_rect(dc, text_x, row_top, (text_right + dm(s, 2)) - text_x, row_h, g.brush_lcd_lit)
 		}
 
 		name := library.names[idx]
-		if len(name) > max_chars {
-			name = name[:max_chars]
+		text_w := small_text_width(s, name)
+
+		if selected && text_w > avail {
+			// Long name in the playing row: slide it, then come round again
+			// after a gap. Clipped to the row so it cannot run into the arrows.
+			g.pl_overflow = true
+			gap := dm(s, 16)
+			cycle := f32(text_w + gap)
+			off := f32(now - g.pl_start)*f32(dm(s, PLAYLIST_SCROLL_PPS))
+			for off >= cycle {
+				off -= cycle
+			}
+			ox := text_x - i32(off)
+
+			saved := win.SaveDC(dc)
+			IntersectClipRect(dc, text_x, row_top, text_right, row_top + row_h)
+			draw_small_text(dc, ox, row_top + dm(s, 1), s, name, g.brush_lcd_unlit)
+			draw_small_text(dc, ox + i32(cycle), row_top + dm(s, 1), s, name, g.brush_lcd_unlit)
+			win.RestoreDC(dc, saved)
+		} else {
+			shown := name
+			if len(shown) > max_chars {
+				shown = shown[:max_chars]
+			}
+			draw_small_text(dc, text_x, row_top + dm(s, 1), s, shown, g.brush_lcd_unlit)
 		}
-		draw_small_text(dc, text_x, row_top + dm(s, 1), s, name, g.brush_lcd_unlit)
 	}
 
-	triangle_up(dc, lay.arrow_up, g.brush_lcd_lit)
-	triangle_down(dc, lay.arrow_down, g.brush_lcd_lit)
+	if full {
+		triangle_up(dc, lay.arrow_up, g.brush_lcd_lit)
+		triangle_down(dc, lay.arrow_down, g.brush_lcd_lit)
+	}
 }
 
 // Backlight glyph: a disc with eight rays, sized to match the stop icon.
-draw_theme_icon :: proc "contextless" (dc: win.HDC, r: win.RECT, s: Scale, brush: win.HBRUSH) {
-	u := dm(s, 1)
-	if u < 1 {
-		u = 1
+draw_size_gauge :: proc "contextless" (dc: win.HDC, lay: ^Layout, s: Scale) {
+	for i in 0 ..< 3 {
+		r := lay.size_rects[i]
+		if i == g.scale_index {
+			win.FillRect(dc, &r, g.brush_lcd_lit)
+		} else {
+			hollow_r(dc, r, max(1, dm(s, 1)), g.brush_lcd_ghost)
+		}
 	}
-	x := i32(r.left)
-	y := i32(r.top)
-
-	// Disc. GDI's Ellipse degenerates to a diamond at this size, so the circle
-	// is drawn as ten scanlines instead.
-	insets := [10]i32{3, 2, 1, 0, 0, 0, 0, 1, 2, 3}
-	widths := [10]i32{4, 6, 8, 10, 10, 10, 10, 8, 6, 4}
-	for row in 0 ..< 10 {
-		fill_rect(dc, x + (3 + insets[row])*u, y + (3 + i32(row))*u, widths[row]*u, u, brush)
-	}
-
-	// Four cardinal rays and four small diagonal glints.
-	fill_rect(dc, x + 7*u, y + 0*u, 2*u, 2*u, brush)    // north
-	fill_rect(dc, x + 7*u, y + 14*u, 2*u, 2*u, brush)   // south
-	fill_rect(dc, x + 0*u, y + 7*u, 2*u, 2*u, brush)    // west
-	fill_rect(dc, x + 14*u, y + 7*u, 2*u, 2*u, brush)   // east
-	fill_rect(dc, x + 2*u, y + 2*u, u, u, brush)        // north-west
-	fill_rect(dc, x + 13*u, y + 2*u, u, u, brush)       // north-east
-	fill_rect(dc, x + 2*u, y + 13*u, u, u, brush)       // south-west
-	fill_rect(dc, x + 13*u, y + 13*u, u, u, brush)      // south-east
 }
 
 draw_icons :: proc "contextless" (dc: win.HDC, lay: ^Layout, s: Scale, now: f64) {
+	win.FillRect(dc, &lay.icons, g.brush_lcd_panel)
 	ink   := g.brush_lcd_lit
 	ghost := g.brush_lcd_ghost
 	panel := g.brush_lcd_panel
 	enabled := g.track_loaded
 
 	// Size gauge.
-	for i in 0 ..< 3 {
-		r := lay.size_rects[i]
-		if i == g.scale_index {
-			win.FillRect(dc, &r, ink)
-		} else {
-			hollow_r(dc, r, max(1, dm(s, 1)), ghost)
-		}
-	}
+	draw_size_gauge(dc, lay, s)
 
-	draw_theme_icon(dc, lay.color_btn, s, ink)
+	// LIGHT: a bordered label in the same font as LOAD FILE.
+	btn := lay.color_btn
+	hollow_r(dc, btn, max(1, dm(s, 1)), ink)
+	lw := small_text_width(s, "LIGHT")
+	lh := dm(s, 8)
+	tx := btn.left + (btn.right - btn.left - lw)/2
+	ty := btn.top + (btn.bottom - btn.top - lh)/2
+	draw_small_text(dc, tx, ty, s, "LIGHT", ink)
 
 	nav := ghost
 	if enabled {
@@ -1587,9 +2370,20 @@ draw_small_text :: proc "contextless" (dc: win.HDC, x, y: i32, s: Scale, text: s
 			rows := glyph(ch)
 			for r in 0 ..< 8 {
 				bits := rows[r]
-				for col in 0 ..< 5 {
-					if (bits >> u8(4 - col)) & 1 == 1 {
-						fill_rect(dc, cx + i32(col)*unit, y + i32(r)*unit, unit, unit, brush)
+				if bits == 0 {
+					continue
+				}
+				// One fill per horizontal run of pixels, not one per pixel.
+				run := -1
+				for col in 0 ..< 6 {
+					on := col < 5 && (bits >> u8(4 - col)) & 1 == 1
+					if on {
+						if run < 0 {
+							run = col
+						}
+					} else if run >= 0 {
+						fill_rect(dc, cx + i32(run)*unit, y + i32(r)*unit, i32(col - run)*unit, unit, brush)
+						run = -1
 					}
 				}
 			}
@@ -1890,9 +2684,9 @@ flash_on :: #force_inline proc "contextless" (now: f64) -> bool {
 // Helpers
 //
 
-ensure_back_buffer :: proc "contextless" (hdc: win.HDC, w, h: i32) {
+ensure_back_buffer :: proc "contextless" (hdc: win.HDC, w, h: i32) -> bool {
 	if g.buf_dc != nil && g.buf_w == w && g.buf_h == h {
-		return
+		return false
 	}
 	destroy_back_buffer()
 
@@ -1903,6 +2697,7 @@ ensure_back_buffer :: proc "contextless" (hdc: win.HDC, w, h: i32) {
 	}
 	g.buf_w = w
 	g.buf_h = h
+	return true
 }
 
 destroy_back_buffer :: proc "contextless" () {
@@ -2028,3 +2823,7 @@ destroy_gdi_objects :: proc() {
 fatal :: proc(message: string) {
 	win.MessageBoxW(nil, to_wide(message), to_wide(APP_NAME), win.MB_OK | win.MB_ICONERROR)
 }
+
+
+
+

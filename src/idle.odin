@@ -10,21 +10,25 @@ import "core:math"
 
 IDLE_BIRDS :: 3
 
-idle_lit :: proc "contextless" (x, row, cols: int, now: f64) -> bool {
+idle_lit :: proc "contextless" (x, row, cols, rows: int, now: f64) -> bool {
 	t := f32(now)
+
+	// The scene is authored against an 8-row band; scale row positions so it
+	// sits correctly in any height, while the birds keep their 3-row size.
+	rf := f32(row)/f32(rows)*8
 
 	// Sea: two out-of-phase waves give the surface an irregular roll.
 	w1 := f32(math.sin(f64(f32(x)*0.21 + t*1.7)))
 	w2 := f32(math.sin(f64(f32(x)*0.09 - t*0.9)))
 	surface := f32(5.1) + 1.15*w1 + 0.60*w2
-	if f32(row) >= surface {
+	if rf >= surface {
 		return true
 	}
 
 	// Birds above the water.
 	for i in 0 ..< IDLE_BIRDS {
 		bx := idle_bird_x(i, cols, t)
-		by := idle_bird_y(i, t)
+		by := int(f32(0.9+1.0*f32(math.sin(f64(t*1.3+f32(i)*1.9)))) / 8 * f32(rows))
 		if bird_pixel(int(f32(x) - bx), row - by, i, t) {
 			return true
 		}

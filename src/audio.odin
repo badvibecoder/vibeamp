@@ -34,6 +34,8 @@ audio: struct {
 
 	duration: f32,
 
+	volume: f32, // 0..1, applied at the device
+
 	tap: [TAP_SIZE]f32,
 }
 
@@ -213,6 +215,22 @@ audio_seek :: proc "contextless" (seconds: f32) {
 
 audio_set_looping :: proc "contextless" (on: bool) {
 	intrinsics.atomic_store_explicit(&audio.looping, b32(on), .Release)
+}
+
+// Master volume, 0..1. Applied at the device so the analyzer still sees the
+// signal we produced, not the attenuated output.
+audio_set_volume :: proc "contextless" (v: f32) {
+	vol := v
+	if vol < 0 {
+		vol = 0
+	}
+	if vol > 1 {
+		vol = 1
+	}
+	audio.volume = vol
+	if audio.device_ok {
+		ma.device_set_master_volume(&audio.device, vol)
+	}
 }
 
 audio_position :: proc "contextless" () -> f32 {

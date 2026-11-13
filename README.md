@@ -11,6 +11,9 @@ remembered between runs, and only one instance at a time.
 
 ![vibeamp playing](docs/v0.13-green.png)
 
+> Maintainers: [`HANDOVER.md`](HANDOVER.md) has the architecture, the constraints
+> the code depends on, and the history behind the design decisions.
+
 ## Requirements
 
 - [Odin](https://odin-lang.org/) (built and tested with `dev-2026-11-nightly`)
@@ -43,19 +46,26 @@ Click anything in the panel. Everything also has a keyboard shortcut:
 
 | Control | Action | Key |
 |---|---|---|
-| `LOAD FILE` | pick one MP3 and play it | |
-| `LOAD FOLDER` | pick a folder; every `*.mp3` in it becomes the playlist | |
+| `LOAD FILE` | pick one MP3 and play it | `Ctrl+O` |
+| `LOAD FOLDER` | pick a folder; every `*.mp3` in it becomes the playlist | `Ctrl+F` |
 | size gauge | switch between 1x / 2x / 4x | `=` and `-` |
-| backlight icon | cycle the LCD palette: green → amber → red → grey | |
+| `LIGHT` button | cycle the LCD palette: green → amber → red → grey | `C` |
+| spectrum rows | expand the analyzer to the whole panel; click again (or `Esc`) to go back | |
 | seek bar | click to jump, drag to scrub through the track | |
-| prev / next | previous / next track | |
-| rewind / forward | seek 5 seconds back / forward | |
+| volume slider | click or drag to set the level (also unmutes) | |
+| mute button | toggle mute | |
+| prev / next | previous / next track | `Up` / `Down` |
+| rewind / forward | seek 5 seconds back / forward | `Left` / `Right` |
 | play / pause | start or resume / pause (pause flashes) | `Space` |
 | stop | stop and rewind to 0:00 | `S` |
-| loop / loop 1 | loop the folder / loop one track | `L` (cycles) |
+| loop all | loop the whole playlist on / off | `L` |
+| loop 1 | loop the current track on / off | `Ctrl+L` |
+| mute | toggle mute | `M` |
+| volume | up / down in 5% steps (comes off mute) | `Page Up` / `Page Down` |
 
-Loop modes: **off** plays to the end of the last track and stops, **loop all**
-wraps to the first track, **loop 1** repeats the current track.
+Loop modes are independent: **off** plays to the end of the last track and
+stops, **loop all** wraps to the first track, **loop 1** repeats the current
+track.
 
 ![no track loaded](docs/v0.13-idle.png)
 
@@ -66,7 +76,10 @@ One panel, one 2 px bezel, six bands:
 1. **Matrix** — 18 dot rows: a blank row at the top, 8 for the scrolling title,
    8 for the spectrum analyzer, and a blank row at the bottom, so the content
    never touches the bezel. Dots are 3x3 px with a 1 px gap (4 px pitch), which
-   fits **94 columns** at every size step.
+   fits **94 columns** at every size step. Clicking the analyzer's own rows
+   swaps the panel for the full-window spectrum view — the matrix then fills
+   everything the other bands used (about 48 rows at 1x) with only the size dots
+   left at the bottom; clicking it again, or `Esc`, returns.
 2. **Info** — file name on the left, `0:28 / 2:12 MP3` on the right.
 3. **Load** — `LOAD FILE` and `LOAD FOLDER`.
 4. **Playlist** — a dark 2 px frame with a 5 px buffer, on a darker green than
@@ -74,14 +87,27 @@ One panel, one 2 px bezel, six bands:
    One click on an arrow scrolls exactly one line; clicking a track plays it
    from the start. The playing track gets a dark bar so its light text stands
    out, and the view scrolls itself to keep that row visible. Prev/next always
-   wrap around the list, regardless of the loop mode.
+   wrap around the list, regardless of the loop mode. If the playing row's name
+   is wider than the pane it slowly scrolls left, wrapping round after a gap;
+   the other rows are simply clipped.
 5. **Seek** — a 4 px progress line in a 10 px band, sitting between the playlist
    and the transport. Unheard is drawn in the unlit dot colour, played in the
    ink colour, with a 4x10 px thumb on the boundary. Click anywhere to jump, or
    drag the thumb: the bar follows the pointer and the time readout follows the
    bar. One pixel of the line is one seek step.
-6. **Icons** — size gauge, a backlight glyph that cycles the palette, then prev,
-   rewind, play, pause, stop, forward, next, loop, loop 1.
+6. **Icons** — size gauge, a bordered `LIGHT` button that cycles the palette
+   (same font and size as the load controls), then prev, rewind, play, pause,
+   stop, forward, next, loop, loop 1. Every icon is 16 px tall and sits on one
+   baseline; the gauge squares are 8/12/16 px, bottom aligned, so the largest
+   matches the icon height.
+7. **Volume** — a column down the right side, from the playlist top to the
+   bottom of the icon row, anchored on the mute button: the mute sits one icon
+   gap after the transport, and the speaker and slider are centred on it. The
+   speaker shows the level as sound waves — one per third of the range, plus a
+   taller wave at full volume — and is a readout, not a button. The slider is
+   the seek bar rotated (ink below the level, unlit above, 10x4 thumb); clicking
+   or dragging it sets the level and unmutes. Only the bottom mute button
+   toggles mute.
 
 Icons are crisp geometry (`FillRect` and `Polygon`), not dots, so they read as
 LCD segments rather than as pixel art.
@@ -90,6 +116,8 @@ The client area is **407x250**. The panel is inset by a 10 px margin of window
 background, and the dot field is inset a further 6 px inside the bezel (a 2 px
 bezel plus 4 px of green padding), so the display reads as a screen set into a
 case rather than filling the window edge to edge.
+
+![spectrum view](docs/v0.13-spectrum.png)
 
 ## The spectrum analyzer
 
@@ -106,6 +134,12 @@ display stays dark.
 Verified against a white-noise probe: flat bars across every column, with a
 1 kHz tone spiking exactly one column. `tests/fft_test.odin` checks the FFT
 itself (`odin run tests/fft_test.odin -file`).
+
+The bars follow the **output level**, so the display behaves like an output
+meter: they scale linearly with the volume slider and go flat when muted. While
+a track is loaded there is always at least one lit row, so mute reads as a flat
+line along the bottom rather than an empty panel; with nothing playing the idle
+scene takes over instead.
 
 ## The idle animation
 
@@ -135,6 +169,8 @@ machine-specific, so roaming them between machines buys nothing.
 |---|---|
 | `scale` | window size step (1x / 2x / 4x) |
 | `theme` | LCD palette index |
+| `volume` | level, 0–100 (defaults to 50 when absent) |
+| `muted` | 0 or 1 |
 | `mode` | `folder`, `single` or `none` |
 | `folder_dir` | last `LOAD FOLDER` choice |
 | `file_dir` | folder of the last `LOAD FILE` choice — tracked separately |
@@ -208,7 +244,16 @@ stream. Seeking is a request the callback performs.
 
 - **No console.** Built as a GUI subsystem binary.
 - **Repaints only on change** — when the marquee advances a column, a bar height
-  changes, the flash toggles, or the clock ticks.
+  changes, the flash toggles, or the clock ticks. Analysis and painting are
+  capped at 30 fps; the 60 Hz timer is twice what the display needs.
+- **Dirty bands.** The back buffer persists between frames, so a paint redraws
+  only the bands that changed — the matrix, the clock line, the scrolling
+  playlist row — and blits. That plus batched drawing keeps playback at single
+  digit CPU.
+- **Batched drawing.** The dot field is a GDI pattern brush, so the unlit grid
+  is one fill and each column's lit run is one more; text rows are drawn one
+  fill per horizontal run of pixels. That took the full-window spectrum from
+  ~21% of a core to ~4%.
 - **Double buffered** through a memory DC, so nothing flickers.
 - **Font.** A 5x7 bitmap font covering ASCII letters, digits and common
   punctuation. Other characters render as `?`.
@@ -237,3 +282,4 @@ stream. Seeking is a request the callback performs.
 1. **Volume / mute** with LCD indicators.
 2. **Seek bar** across the panel width.
 3. **ID3 tags** on the info line instead of the file name.
+

@@ -157,6 +157,14 @@ spectrum_update :: proc (cols_in: int, dt: f32, playing: bool) {
 			if level > 1 {
 				level = 1
 			}
+
+			// The bars follow the output level, so the display behaves like an
+			// output meter: quiet at low volume, flat when muted.
+			if g.muted {
+				level = 0
+			} else {
+				level *= g.volume
+			}
 		}
 
 		prev := spectrum.levels[c]
