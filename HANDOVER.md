@@ -33,7 +33,7 @@ F:\deepseek-harness\vibeamp\
   README.md            user-facing
   HANDOVER.md          this file
   bin\vibeamp.exe      build output
-  res\app.rc + app.ico icon resource (rc.exe compiles it)
+  res\app.rc + app.ico  icon + VERSIONINFO resources (rc.exe compiles them)
   docs\*.png           screenshots referenced by README
   src\main.odin        2481 lines — window, layout, paint, input, all drawing
   src\audio.odin        222 — miniaudio device + decoder, the sample tap
@@ -60,8 +60,14 @@ The Odin binary is at `F:\bin\odin-windows-amd64-dev-2026-11a\dist\odin.exe`
 the shell you get here — call it by full path or set `$env:ODIN`.
 
 `build.bat` passes `-resource:%ROOT%res\app.rc`, which makes Odin invoke `rc.exe`
-from the Visual Studio SDK to embed the icon. That leaves a `res\app.res`
-artifact next to the `.rc`; it is gitignored, not source.
+from the Visual Studio SDK. The script holds two resources: the icon (ID 1) and
+a `VERSIONINFO` block that Explorer reads from the PE. That leaves a
+`res\app.res` artifact next to the `.rc`; it is gitignored, not source.
+
+The version therefore lives in **two** places and both must be bumped together
+when releasing: `FILEVERSION`/`VALUE "FileVersion"` in `res/app.rc`, and
+`APP_VERSION` in `src/main.odin`, which is composed into the window title
+(`vibeamp - v1.0`) because the app has no About box.
 
 A build fails with "don't have access to write to bin\vibeamp.exe" whenever an
 instance is running. Kill it first:

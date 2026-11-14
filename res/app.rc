@@ -1,1 +1,29 @@
 1 ICON "vibeamp.ico"
+
+//
+// Keep the version here in sync with APP_VERSION in src/main.odin: the title
+// bar uses the constant, Explorer reads this block.
+//
+1 VERSIONINFO
+FILEVERSION     1,0,0,0
+PRODUCTVERSION  1,0,0,0
+FILEOS          0x40004   // VOS_NT_WINDOWS32
+FILETYPE        0x1       // VFT_APP
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"      // US English, Unicode
+    BEGIN
+      VALUE "FileDescription",  "vibeamp"
+      VALUE "FileVersion",      "1.0"
+      VALUE "ProductName",      "vibeamp"
+      VALUE "ProductVersion",   "1.0"
+      VALUE "OriginalFilename", "vibeamp.exe"
+      VALUE "InternalName",     "vibeamp"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END

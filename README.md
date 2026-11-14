@@ -4,12 +4,13 @@ A native Windows desktop music player, written in Odin against the Win32 API.
 No runtime, no installer, no external DLLs: one `.exe` that opens instantly and
 plays MP3s.
 
-Current state: **v0.13** — a double-height LCD matrix: the title marquee on top,
+Current state: **v1.0** — a double-height LCD matrix: the title marquee on top,
 a live spectrum analyzer under it, then the track info, a scrub bar, the LOAD
-controls, a framed playlist and a clickable transport. Four LCD palettes, sessions
-remembered between runs, and only one instance at a time.
+controls, a framed playlist, a clickable transport and a vertical volume column.
+Four LCD palettes, a full-window spectrum view, sessions remembered between runs,
+and only one instance at a time.
 
-![vibeamp playing](docs/v0.13-green.png)
+![vibeamp playing](docs/v1.0-green.png)
 
 > Maintainers: [`HANDOVER.md`](HANDOVER.md) has the architecture, the constraints
 > the code depends on, and the history behind the design decisions.
@@ -18,8 +19,8 @@ remembered between runs, and only one instance at a time.
 
 - [Odin](https://odin-lang.org/) (built and tested with `dev-2026-11-nightly`)
 - Visual Studio Build Tools with the C++ workload (Odin uses the MSVC linker)
-- The Windows SDK's `rc.exe` (comes with the C++ workload) — the build embeds the
-  application icon through a resource script
+- The Windows SDK's `rc.exe` (comes with the C++ workload) — the build compiles
+  `res/app.rc`, which embeds the application icon and the version metadata
 
 MP3 decoding and audio output come from **miniaudio**, which ships with Odin as
 `vendor:miniaudio` and is linked statically — nothing to install.
@@ -67,7 +68,7 @@ Loop modes are independent: **off** plays to the end of the last track and
 stops, **loop all** wraps to the first track, **loop 1** repeats the current
 track.
 
-![no track loaded](docs/v0.13-idle.png)
+![no track loaded](docs/v1.0-idle.png)
 
 ## The LCD panel
 
@@ -117,7 +118,7 @@ background, and the dot field is inset a further 6 px inside the bezel (a 2 px
 bezel plus 4 px of green padding), so the display reads as a screen set into a
 case rather than filling the window edge to edge.
 
-![spectrum view](docs/v0.13-spectrum.png)
+![spectrum view](docs/v1.0-spectrum.png)
 
 ## The spectrum analyzer
 
@@ -214,9 +215,9 @@ above the panel, near-black lit dots, and a playlist infill just below the panel
 
 The window background stays `#1A1D20` in every theme.
 
-![amber](docs/v0.13-amber.png)
+![amber](docs/v1.0-amber.png)
 
-![red](docs/v0.13-red.png)
+![red](docs/v1.0-red.png)
 
 ## Code map
 
@@ -268,6 +269,10 @@ stream. Seeking is a request the callback performs.
   and the title bar all read it from the PE, and the window class loads the same
   ID so the small title-bar icon matches. Without the resource Windows shows its
   generic application icon.
+- **The version is in two places on purpose.** `res/app.rc` carries a
+  `VERSIONINFO` block that Explorer's Properties → Details reads out of the PE,
+  and `APP_VERSION` in `src/main.odin` feeds the title bar, since the app has no
+  About box. Bump both when releasing.
 
 ## Known gaps
 
@@ -282,4 +287,5 @@ stream. Seeking is a request the callback performs.
 1. **Volume / mute** with LCD indicators.
 2. **Seek bar** across the panel width.
 3. **ID3 tags** on the info line instead of the file name.
+
 

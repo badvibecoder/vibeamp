@@ -34,6 +34,7 @@ foreign g32 {
 //
 
 APP_NAME     :: "vibeamp"
+APP_VERSION  :: "v1.0"
 WINDOW_CLASS :: "VibeAmpWindowClass"
 
 CLIENT_WIDTH  :: 407
@@ -703,7 +704,9 @@ main :: proc() {
 	apply_theme()
 
 	g.class_name  = to_wide(WINDOW_CLASS)
-	g.title       = to_wide(APP_NAME)
+	// The app has no About box, so the title bar is the only place a running
+	// copy names its version.
+	g.title       = to_wide(strings.concatenate({APP_NAME, " - ", APP_VERSION}))
 	g.cursor_hand = win.LoadCursorW(nil, win.wstring(win.MAKEINTRESOURCEW(32649))) // IDC_HAND
 
 	freq: win.LARGE_INTEGER
